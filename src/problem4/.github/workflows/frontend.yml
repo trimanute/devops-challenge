@@ -1,0 +1,144 @@
+name: frontend
+
+# Pull request: lint, test, audit and build (no AWS access).
+# Push to main:  the same, then publish the build, deploy to staging, then production (approval).
+# Manual run:    redeploy any previously published SHA to an environment (rollback).
+on:
+  pull_request:
+    paths:
+      - "frontend/**"
+      - ".github/workflows/frontend.yml"
+      - ".github/workflows/_deploy-frontend.yml"
+  push:
+    branches: [main]
+    paths:
+      - "frontend/**"
+      - ".github/workflows/frontend.yml"
+      - ".github/workflows/_deploy-frontend.yml"
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: "Full commit SHA of a published release to deploy (rollback target)"
+        required: true
+        type: string
+      environment:
+        description: "Target environment"
+        required: true
+        type: choice
+        options: [staging, production]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: frontend-${{ github.event_name == 'pull_request' && github.ref || 'release' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  ci:
+    if: github.event_name != 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - run: npm ci --ignore-scripts
+      - run: npm run lint --if-present
+      - run: npm test --if-present
+      - run: npm audit --audit-level=high
+
+      # Built once. The same files are promoted from staging to production, so there is no
+      # per environment build and no environment specific values baked into the bundle.
+      - name: Build
+        run: npm run build
+
+      - name: Check the build output and add version.json
+        env:
+          RELEASE_SHA: ${{ github.sha }}
+        run: |
+          test -f dist/index.html || { echo "build did not produce dist/index.html" >&2; exit 1; }
+          printf '{"sha":"%s"}\n' "$RELEASE_SHA" > dist/version.json
+          mkdir -p release
+          tar -czf "release/$RELEASE_SHA.tar.gz" -C dist .
+          (cd release && sha256sum "$RELEASE_SHA.tar.gz" > "$RELEASE_SHA.tar.gz.sha256")
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: web-${{ github.sha }}
+          path: frontend/release/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: ci
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      id-token: write # OIDC, no stored AWS keys
+      contents: read
+    env:
+      RELEASE_SHA: ${{ github.sha }}
+      ARTIFACT_BUCKET: ${{ vars.ARTIFACT_BUCKET }}
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: web-${{ github.sha }}
+          path: release
+
+      - uses: aws-actions/configure-aws-credentials@b47578312673ae6fa5b5096b330d9fbac3d116df # v4.2.1
+        with:
+          role-to-assume: ${{ vars.AWS_PUBLISH_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Upload build to S3
+        run: |
+          key="web/$RELEASE_SHA.tar.gz"
+          if aws s3api head-object --bucket "$ARTIFACT_BUCKET" --key "$key" >/dev/null 2>&1; then
+            echo "s3://$ARTIFACT_BUCKET/$key already exists, keeping it"
+          else
+            aws s3 cp "release/$RELEASE_SHA.tar.gz" "s3://$ARTIFACT_BUCKET/$key" --only-show-errors
+            aws s3 cp "release/$RELEASE_SHA.tar.gz.sha256" "s3://$ARTIFACT_BUCKET/$key.sha256" --only-show-errors
+          fi
+
+  staging:
+    needs: publish
+    permissions:
+      id-token: write
+      contents: read
+    uses: ./.github/workflows/_deploy-frontend.yml
+    with:
+      environment: staging
+      sha: ${{ github.sha }}
+
+  # The "production" GitHub environment requires a reviewer, so this waits for approval
+  production:
+    needs: staging
+    permissions:
+      id-token: write
+      contents: read
+    uses: ./.github/workflows/_deploy-frontend.yml
+    with:
+      environment: production
+      sha: ${{ github.sha }}
+
+  redeploy:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    permissions:
+      id-token: write
+      contents: read
+    uses: ./.github/workflows/_deploy-frontend.yml
+    with:
+      environment: ${{ inputs.environment }}
+      sha: ${{ inputs.sha }}

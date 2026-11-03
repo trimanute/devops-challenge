@@ -1,14 +1,13 @@
-version: "3.9"
-
 services:
   nginx:
     image: nginx:1.25
     ports:
       - "8080:80"
     volumes:
-      - ./nginx/conf.d:/etc/nginx/conf.d
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
     depends_on:
       - api
+    restart: unless-stopped
 
   api:
     build: ./api
@@ -16,13 +15,35 @@ services:
       - DB_HOST=postgres
       - REDIS_HOST=redis
     depends_on:
-      - postgres
-      - redis
+      # wait until the database and redis are really ready, not only started
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
 
   postgres:
     image: postgres:15
     environment:
       POSTGRES_PASSWORD: postgres
+    volumes:
+      # keep the data when the container is recreated
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
 
   redis:
     image: redis:7
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+volumes:
+  pgdata:

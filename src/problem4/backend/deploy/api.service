@@ -1,0 +1,25 @@
+# Installed on the instance image (AMI / cloud-init) once, not by the pipeline.
+[Unit]
+Description=Sample API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=api
+Group=api
+WorkingDirectory=/opt/api/current
+EnvironmentFile=/opt/api/current/release.env
+Environment=NODE_ENV=production PORT=3000
+ExecStart=/usr/bin/node src/server.js
+Restart=always
+RestartSec=2
+TimeoutStopSec=15
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

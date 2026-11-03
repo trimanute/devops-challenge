@@ -10,15 +10,18 @@ const pool = new Pool({
   password: "postgres",
   database: "postgres",
   port: 5432,
+  connectionTimeoutMillis: 2000, // give up after 2 seconds, do not wait forever
 });
+
+// Without this, an error on an idle connection (for example the database restarts) crashes the app
+pool.on("error", (err) => console.error("postgres pool error", err.message));
 
 const redis = new Redis({ host: process.env.REDIS_HOST, port: 6379 });
 
 app.get("/api/users", async (req, res) => {
   try {
-    const db = await pool.connect();
-    const result = await db.query("SELECT NOW()");
-    db.release();
+    // pool.query gets a connection and always gives it back, even when the query fails
+    const result = await pool.query("SELECT NOW()");
 
     await redis.set("last_call", Date.now());
     res.json({ ok: true, time: result.rows[0] });
